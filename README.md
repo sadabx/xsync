@@ -1,44 +1,39 @@
 <div align="center">
-  <img src="assets/logo.svg" alt="gdsync Logo" width="120"/>
-  <h1>gdsync</h1>
-  <p><b>Git-aware real-time Google Drive sync daemon for Linux.</b></p>
+  <img src="assets/logo.svg" alt="xsync Logo" width="120"/>
+  <h1>xsync</h1>
+  <p><b>Linux-Native Google Drive client with native <code>.gitignore</code> integration.</b></p>
   <p>
-    <a href="https://github.com/sadabx/gdsync/releases"><img src="https://img.shields.io/badge/Release-v0.2.0-blue?style=flat-square" alt="Release"></a>
+    <a href="https://github.com/sadabx/xsync/releases"><img src="https://img.shields.io/badge/Release-v0.2.0-blue?style=flat-square" alt="Release"></a>
     <img src="https://img.shields.io/badge/Rust-1.75%2B-orange?style=flat-square&logo=rust&logoColor=white" alt="Rust">
     <img src="https://img.shields.io/badge/Platform-Linux-green?style=flat-square&logo=linux&logoColor=white" alt="Linux">
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue.svg?style=flat-square" alt="License"></a>
   </p>
 </div>
 
-Google Drive for Desktop syncs everything indiscriminately—uploading `node_modules`, `.venv`, and build targets until your cloud storage runs out of space.
-
-`gdsync` is a background Linux daemon written in Rust. It syncs changes to Google Drive in real time using kernel `inotify` events while evaluating your project's `.gitignore` and `.gdsyncignore` rules via `ripgrep`'s `ignore` engine.
+`xsync` provides a fast, native Google Drive synchronization experience on Linux. Built with Rust, it synchronizes local directories with Google Drive in real time using kernel `inotify` events while automatically respecting `.gitignore` and `.xsyncignore` rules to keep build targets, dependencies, and temporary files from syncing to the cloud.
 
 ---
 
 ## Features
 
-- **Interactive TUI Environment**: Run bare `gdsync` for a Claude Code-inspired terminal dashboard with live Google Drive connection status, tracked directories, and arrow-key action menus.
-- **Respects `.gitignore` & `.gdsyncignore`**: Automatically ignores build bloat (`node_modules/`, `target/`, `.venv/`, `.cxx/`) across root and nested subdirectories. Custom `.gdsyncignore` works in non-Git folders.
-- **Concurrent Transfers & Progress Bars**: Multi-threaded uploads/downloads with bounded worker pools and real-time progress bars (`indicatif`).
-- **Zero-Data-Loss Safe Trashing**: Local deletions move remote files to Google Drive's Trash (recoverable for 30 days) instead of permanently purging them.
-- **Kernel-Level Watching**: Debounces rapid file changes with `inotify` before uploading.
-- **SQLite State Tracking**: Tracks paths, MD5 checksums, and Google Drive file IDs locally in `~/.config/gdsync/state.db`.
-- **Automatic Conflict Preservation**: Detects offline two-way edits and preserves local modifications as `<file>.conflict-<timestamp>.<ext>` while pulling remote changes with zero data loss.
-- **Cascading Deletion Safety Guard**: Automatically blocks mass deletions (>20% or >50 files) if an external drive or network share unmounts unexpectedly (bypassable with `--force`).
-- **Resumable Chunked Uploads**: Direct asynchronous Google Drive v3 REST API implementation with automatic exponential backoff retry and chunk recovery.
-- **Built-in Systemd Daemon & Shell Completions**: Integrated service helper and auto-completions for Bash, Zsh, and Fish.
+- **Interactive Terminal Dashboard**: Run `xsync` with no arguments to launch an interactive dashboard with connection status, tracked directories, and guided actions.
+- **Cross-Platform Desktop GUI**: Modern desktop app with system tray controls, live sync indicators, storage quota progress, diff visualization, and folder management.
+- **Git & Ignore Integration**: Automatically honors `.gitignore` rules in current and nested directories, with support for custom `.xsyncignore` patterns.
+- **Real-Time Synchronization**: Watches local filesystem events using Linux `inotify` with intelligent debounce buffering before uploading.
+- **Two-Way Reconciliation & Conflict Handling**: Fast two-way sync with automatic conflict copy preservation (`.conflict-<timestamp>`) and bulk deletion safeguards.
+- **Resumable Transfers**: Chunked resumable uploads and downloads with bounded concurrency, real-time progress bars, and automatic exponential backoff.
+- **Google Workspace Support**: Automatically exports Google Docs, Sheets, and Slides into standard office formats (`.docx`, `.xlsx`, `.pptx`).
+- **Cloud Tools**: Server-side recursive folder diffing (`xsync diff`) and zero-download folder merging (`xsync merge`).
+- **Background Daemon**: Integrated systemd user service management with one-command installation.
 
 ---
 
-## Quick Start
-
-### 1. Installation
+## Installation
 
 **One-line install (Linux x86_64 / aarch64)**:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sadabx/gdsync/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sadabx/xsync/main/install.sh | bash
 ```
 
 <details>
@@ -47,162 +42,108 @@ curl -fsSL https://raw.githubusercontent.com/sadabx/gdsync/main/install.sh | bas
 
 ```bash
 # Direct install from Git
-cargo install --git https://github.com/sadabx/gdsync.git gdsync-cli
+cargo install --git https://github.com/sadabx/xsync.git xsync
 
 # Or clone and compile locally
-git clone https://github.com/sadabx/gdsync.git
-cd gdsync
-cargo install --path crates/gdsync-cli
+git clone https://github.com/sadabx/xsync.git
+cd xsync
+cargo install --path crates/xsync-cli
 ```
 </details>
-
-### 2. Interactive Environment or Direct CLI
-
-You can run `gdsync` by itself at any time to enter the interactive TUI menu:
-
-```bash
-gdsync
-```
-
-Or execute commands directly:
-
-### 3. Authenticate
-
-```bash
-gdsync auth
-```
-
-*Opens your browser to complete Google OAuth2 PKCE login. Tokens are cached locally in `~/.config/gdsync/token.json`.*
-
-<details>
-<summary><b>(Optional) Using your own Google Cloud credentials for dedicated quota</b></summary>
-<br/>
-
-`gdsync` works out of the box with zero setup using pre-registered public desktop credentials. If you perform massive initial syncs or want private, unthrottled API quota (12,000 requests/min):
-
-1. Open [Google Cloud Console](https://console.cloud.google.com/) and click **New Project** (name it `gdsync`).
-2. Go to **APIs & Services > Library**, search for **Google Drive API**, and click **Enable**.
-3. Go to **APIs & Services > OAuth consent screen**:
-   - Select **External**, enter an App name (`gdsync`) and your email.
-   - Under **Test users**, add your Google email address.
-4. Go to **APIs & Services > Credentials**:
-   - Click **Create Credentials > OAuth client ID**.
-   - Choose Application type: **Desktop app**.
-   - Copy your **Client ID** and **Client Secret**.
-5. Run authentication with your keys:
-   ```bash
-   gdsync auth --client-id "YOUR_CLIENT_ID" --client-secret "YOUR_CLIENT_SECRET"
-   ```
-Your credentials will be stored in `~/.config/gdsync/config.toml` so you never need to re-enter them.
-</details>
-
-### 4. Link & Watch a Folder
-
-```bash
-# Link your workspace to a Drive folder
-gdsync init ~/Codes -d "Codes_Backup"
-
-# (Optional) Dry-run scan to preview what will sync
-gdsync scan
-
-# (Optional) Preview sync plan without modifying anything
-gdsync sync --dry-run
-
-# Run an initial two-way reconciliation (with 4 concurrent workers)
-gdsync sync
-
-# Start the real-time background watcher daemon
-gdsync watch
-```
 
 ---
 
-## CLI Reference
+## Quick Start
+
+### 1. Authenticate
+```bash
+xsync auth
+```
+*Opens your default browser to complete OAuth2 PKCE login. Works out of the box with zero Google Cloud configuration required.*
+
+### 2. Link a Folder
+```bash
+# Link your workspace to a remote Google Drive folder
+xsync init ~/Projects -d "Projects_Backup"
+
+# (Optional) Preview what files will be synced
+xsync scan
+```
+
+### 3. Sync or Watch
+```bash
+# Run a one-time two-way synchronization pass
+xsync sync
+
+# Or start the real-time background watcher
+xsync watch
+```
+
+> **Tip**: Run `xsync` with no arguments anytime to access the interactive menu.
+
+---
+
+## Desktop GUI
+
+`xsync` includes a fast, 100% native Rust desktop GUI powered by [Slint](https://slint.dev) (no WebKit, HTML, or browser runtime required):
+
+```bash
+# Launch Native GUI
+cargo run --package xsync-gui
+```
+
+Features include a real-time storage quota bar, native file picker (`rfd`), directory management, live activity feeds, visual folder diffing, and one-click cloud folder merges.
+
+---
+
+## Commands
 
 | Command | Usage | Description |
 | --- | --- | --- |
-| `auth` | `gdsync auth [--client-id <ID> --client-secret <SEC>]` | Google Drive OAuth2 login |
-| `init` | `gdsync init <local_path> -d <remote_folder_or_id>` | Map a local directory to Google Drive |
-| `scan` | `gdsync scan [path]` | Dry-run list of files to sync (respecting `.gitignore`) |
-| `sync` | `gdsync sync [path] [--dry-run] [--concurrency <N>] [--force]` | Two-way reconciliation with progress bars & safety guards |
-| `watch` | `gdsync watch [path] [--notify] [--force]` | Start real-time inotify watcher daemon |
-| `status` | `gdsync status` | Show tracked paths, database records, and sync queue |
-| `diff` | `gdsync diff <remote_folder1> <remote_folder2>` | Compare two remote Drive folders via MD5 |
-| `merge` | `gdsync merge <source_folder> <target_folder>` | Non-destructively merge remote folders |
-| `service` | `gdsync service <install\|status\|start\|stop\|logs>` | Manage background systemd user service |
-| `completions` | `gdsync completions <bash\|zsh\|fish>` | Generate shell auto-completions |
+| *(default)* | `xsync` | Launch interactive terminal dashboard |
+| `auth` | `xsync auth [--client-id <ID> --client-secret <SECRET>]` | Authenticate with Google Drive via OAuth2 PKCE |
+| `init` | `xsync init <path> -d <remote_folder_or_id>` | Link a local directory to Google Drive |
+| `scan` | `xsync scan [path]` | Preview files that will sync, respecting `.gitignore` |
+| `sync` | `xsync sync [path] [--dry-run] [--concurrency <N>] [--force]` | Run two-way reconciliation with progress indicators |
+| `watch` | `xsync watch [path] [--notify] [--force]` | Start real-time background inotify daemon |
+| `status` | `xsync status` | Display tracked paths, sync queue, and database status |
+| `diff` | `xsync diff <folder1> <folder2>` | Compare two remote Drive folders via MD5 checksums |
+| `merge` | `xsync merge <source_folder> <target_folder>` | Server-side merge unique files without downloading |
+| `service` | `xsync service <install\|status\|start\|stop\|logs>` | Manage the systemd background user service |
+| `completions` | `xsync completions <bash\|zsh\|fish>` | Generate shell auto-completions |
 
 ---
 
 ## Run as a Background Service
 
-### Option A: Automatic (Built-in Helper)
-
-Install, enable, and start `gdsync` with a single command:
+Run `xsync` continuously in the background using the integrated systemd manager:
 
 ```bash
-# Install and start systemd user service
-gdsync service install
+# Install, enable, and start user service
+xsync service install
 
-# Check service status
-gdsync service status
+# Check status
+xsync service status
 
-# Follow live daemon logs
-gdsync service logs
-```
-
-### Option B: Manual Systemd Unit
-
-1. Create `~/.config/systemd/user/gdsync.service`:
-
-```ini
-[Unit]
-Description=gdsync background daemon
-After=network-online.target
-
-[Service]
-Type=simple
-ExecStart=%h/.cargo/bin/gdsync watch
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-```
-
-2. Enable and start:
-
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now gdsync.service
+# View live daemon logs
+xsync service logs
 ```
 
 ---
 
 ## Shell Completions
 
-Generate shell completions for your shell:
+Generate shell completions:
 
 ```bash
-# Zsh
-gdsync completions zsh > ~/.zfunc/_gdsync
-
 # Bash
-gdsync completions bash > ~/.local/share/bash-completion/completions/gdsync
+xsync completions bash > ~/.local/share/bash-completion/completions/xsync
+
+# Zsh
+xsync completions zsh > ~/.zfunc/_xsync
 
 # Fish
-gdsync completions fish > ~/.config/fish/completions/gdsync.fish
-```
-
----
-
-## Storage Layout
-
-```text
-~/.config/gdsync/
-├── config.toml    # Directory mappings and remote IDs
-├── state.db       # SQLite WAL database (file hashes & IDs)
-└── token.json     # Stored OAuth2 tokens
+xsync completions fish > ~/.config/fish/completions/xsync.fish
 ```
 
 ---

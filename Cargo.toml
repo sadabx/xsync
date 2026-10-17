@@ -1,7 +1,8 @@
 [workspace]
 members = [
-    "crates/gdsync-core",
-    "crates/gdsync-cli",
+    "crates/xsync-core",
+    "crates/xsync-cli",
+    "crates/xsync-gui",
 ]
 resolver = "2"
 
@@ -28,4 +29,4 @@ rand = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 indicatif = "0.17"
 clap_complete = "4.5"
-gdsync-core = { path = "crates/gdsync-core" }
+xsync-core = { path = "crates/xsync-core" }

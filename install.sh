@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# gdsync - Git-Aware Realtime Google Drive Sync
+# xsync - Linux-Native Git-Aware Realtime Google Drive Sync
 # One-line installer script
 
-REPO="sadabx/gdsync"
-BINARY_NAME="gdsync"
+REPO="sadabx/xsync"
+BINARY_NAME="xsync"
 
 # Colors for output
 RED='\033[0;31m'
@@ -34,7 +34,7 @@ error() {
 # 1. Platform Detection
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 if [ "$OS" != "linux" ]; then
-    error "gdsync is currently designed and optimized for Linux (inotify support required)."
+    error "xsync is currently designed and optimized for Linux (inotify support required)."
 fi
 
 ARCH="$(uname -m)"
@@ -46,7 +46,7 @@ case "$ARCH" in
         TARGET_ARCH="aarch64"
         ;;
     *)
-        error "Unsupported architecture: $ARCH. gdsync supports x86_64 and aarch64."
+        error "Unsupported architecture: $ARCH. xsync supports x86_64 and aarch64."
         ;;
 esac
 
@@ -79,7 +79,7 @@ trap cleanup EXIT
 info "Checking for latest release of ${REPO}..."
 DOWNLOADED=0
 
-RELEASE_URL="https://github.com/${REPO}/releases/latest/download/gdsync-linux-${TARGET_ARCH}.tar.gz"
+RELEASE_URL="https://github.com/${REPO}/releases/latest/download/xsync-linux-${TARGET_ARCH}.tar.gz"
 
 if curl -sI --fail "$RELEASE_URL" >/dev/null 2>&1; then
     info "Downloading prebuilt binary for ${TARGET_ARCH}..."
@@ -95,7 +95,7 @@ fi
 if [ "$DOWNLOADED" -eq 0 ]; then
     if command -v cargo >/dev/null 2>&1; then
         info "Precompiled release binary not found for ${TARGET_ARCH}. Building via cargo..."
-        cargo install --git "https://github.com/${REPO}.git" gdsync-cli --root "${TMP_DIR}/cargo_build"
+        cargo install --git "https://github.com/${REPO}.git" xsync --root "${TMP_DIR}/cargo_build"
         install -m 755 "${TMP_DIR}/cargo_build/bin/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
         DOWNLOADED=1
     else
@@ -121,4 +121,4 @@ case ":$PATH:" in
         ;;
 esac
 
-printf "\nRun '${BOLD}gdsync${NC}' to start the interactive environment.\n"
+printf "\nRun '${BOLD}xsync${NC}' to start the interactive environment.\n"
