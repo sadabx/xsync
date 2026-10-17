@@ -499,7 +499,14 @@ WantedBy=default.target
 
             rt_clone.spawn(async move {
                 use xsync_core::auth::{execute_oauth_login, save_stored_token, DEFAULT_CLIENT_ID, DEFAULT_CLIENT_SECRET};
-                if let Ok(token) = execute_oauth_login(DEFAULT_CLIENT_ID, DEFAULT_CLIENT_SECRET.map(|s| s.to_string())).await {
+                let cfg = load_config().unwrap_or_default();
+                let (cid, csec) = if let Some(ref id) = cfg.client_id {
+                    (id.clone(), cfg.client_secret.clone())
+                } else {
+                    (DEFAULT_CLIENT_ID.to_string(), DEFAULT_CLIENT_SECRET.map(|s| s.to_string()))
+                };
+
+                if let Ok(token) = execute_oauth_login(&cid, csec).await {
                     let _ = save_stored_token(&token);
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(w) = window_weak_inner.upgrade() {
