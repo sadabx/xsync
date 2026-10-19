@@ -723,7 +723,10 @@ impl SyncCoordinator {
                 let parent_dir = rel_path.parent().unwrap_or_else(|| Path::new(""));
                 let target_parent_id = self.ensure_remote_dir_cached(parent_dir).await?;
 
-                let file_name = rel_path.file_name().unwrap().to_string_lossy();
+                let Some(file_name_os) = rel_path.file_name() else {
+                    return Ok(());
+                };
+                let file_name = file_name_os.to_string_lossy();
                 let existing_id = existing_record.as_ref().map(|r| r.drive_id.as_str());
 
                 info!("Watcher triggered upload for: {:?}", rel_path);

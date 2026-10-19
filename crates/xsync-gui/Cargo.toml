@@ -1,7 +1,7 @@
 [package]
 name = "xsync-gui"
 version = "0.2.0"
-description = "Fast, native Google Drive Desktop GUI for Linux, Windows, and macOS (built with Slint)"
+description = "Fast, modern Google Drive Desktop GUI for Linux (built with Tauri v2, Svelte, and Tailwind CSS)"
 authors = ["Sadab <sadabsiperkhan@gmail.com>"]
 license = "GPL-3.0"
 repository = "https://github.com/sadabx/xsync"
@@ -9,9 +9,7 @@ edition = "2021"
 
 [dependencies]
 xsync-core = { path = "../xsync-core" }
-slint = "1.18"
-i-slint-core = "1.18"
-rfd = "0.15"
+tauri = { version = "2", features = ["tray-icon"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -19,6 +17,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true }
+rfd = "0.15"
 
 [build-dependencies]
-slint-build = "1.18"
+tauri-build = { version = "2", features = [] }

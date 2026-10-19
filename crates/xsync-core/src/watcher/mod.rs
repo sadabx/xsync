@@ -90,19 +90,21 @@ impl FsWatcher {
                 continue;
             }
 
-            // Determine if created/modified or deleted
-            let change = match event.kind {
-                EventKind::Remove(_) => FsChange::Delete(path.clone()),
-                _ => {
+            // Only handle mutations: Create, Modify, and Remove.
+            // Explicitly ignore EventKind::Access, Any, or Other to prevent feedback loops
+            match event.kind {
+                EventKind::Create(_) | EventKind::Modify(_) => {
                     if path.exists() {
-                        FsChange::CreateOrModify(path.clone())
-                    } else {
-                        FsChange::Delete(path.clone())
+                        let _ = tx.blocking_send(FsChange::CreateOrModify(path.clone()));
                     }
                 }
-            };
-
-            let _ = tx.blocking_send(change);
+                EventKind::Remove(_) => {
+                    let _ = tx.blocking_send(FsChange::Delete(path.clone()));
+                }
+                _ => {
+                    // Ignore non-mutation events like reads/accesses
+                }
+            }
         }
     }
 }

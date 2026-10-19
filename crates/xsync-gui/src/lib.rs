@@ -1,16 +1,102 @@
-slint::include_modules!();
-
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use anyhow::Result;
+use chrono::{DateTime, Local, Utc};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use slint::{ComponentHandle, ModelRc, VecModel};
+use tauri::State;
 use tokio::runtime::Runtime;
-use xsync_core::auth::{load_stored_token, token_path};
+use xsync_core::auth::{execute_oauth_login, load_stored_token, save_stored_token, token_path, DEFAULT_CLIENT_ID, DEFAULT_CLIENT_SECRET};
 use xsync_core::config::{add_or_update_directory, load_config, save_config};
 use xsync_core::db::Database;
-use xsync_core::drive::{DriveClient, DriveFile};
+use xsync_core::drive::DriveClient;
 use xsync_core::sync::{SyncCoordinator, SyncOptions};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchedDirDto {
+    pub local_path: String,
+    pub drive_folder_id: String,
+    pub drive_folder_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentFileDto {
+    pub rel_path: String,
+    pub size_str: String,
+    pub time_str: String,
+    pub is_syncing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetailedFileDto {
+    pub name: String,
+    pub rel_path: String,
+    pub full_path: String,
+    pub local_root: String,
+    pub folder_name: String,
+    pub size_bytes: u64,
+    pub size_str: String,
+    pub modified_secs: i64,
+    pub time_str: String,
+    pub synced_time_str: String,
+    pub extension: String,
+    pub category: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CategoryStatsDto {
+    pub documents_bytes: u64,
+    pub documents_count: usize,
+    pub images_bytes: u64,
+    pub images_count: usize,
+    pub videos_bytes: u64,
+    pub videos_count: usize,
+    pub audio_bytes: u64,
+    pub audio_count: usize,
+    pub code_bytes: u64,
+    pub code_count: usize,
+    pub archives_bytes: u64,
+    pub archives_count: usize,
+    pub others_bytes: u64,
+    pub others_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffItemDto {
+    pub path: String,
+    pub side: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppStateDto {
+    pub is_connected: bool,
+    pub is_syncing: bool,
+    pub is_paused: bool,
+    pub user_name: String,
+    pub user_email: String,
+    pub status_message: String,
+    pub storage_used_str: String,
+    pub storage_total_str: String,
+    pub storage_ratio: f32,
+    pub total_directories: usize,
+    pub total_files_tracked: usize,
+    pub total_bytes_str: String,
+    pub directories: Vec<WatchedDirDto>,
+}
+
+pub struct GuiContext {
+    pub is_paused: Arc<AtomicBool>,
+    pub is_syncing: Arc<AtomicBool>,
+    pub status_message: Arc<std::sync::Mutex<String>>,
+    pub rt: Arc<Runtime>,
+}
+
+struct SyncGuard(Arc<AtomicBool>);
+impl Drop for SyncGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
 
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
@@ -29,7 +115,6 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn format_timestamp(ts: i64) -> String {
-    use chrono::{DateTime, Local, Utc};
     if let Some(utc) = DateTime::<Utc>::from_timestamp(ts, 0) {
         let local: DateTime<Local> = DateTime::from(utc);
         local.format("%b %d, %H:%M").to_string()
@@ -38,26 +123,64 @@ fn format_timestamp(ts: i64) -> String {
     }
 }
 
-pub struct AppState {
-    pub is_paused: Arc<AtomicBool>,
-    pub rt: Arc<Runtime>,
+fn format_relative_timestamp(ts: i64) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let diff = now.saturating_sub(ts);
+    if diff < 15 {
+        "Just now".to_string()
+    } else if diff < 60 {
+        format!("{}s ago", diff)
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86400 {
+        format!("{}h ago", diff / 3600)
+    } else if let Some(utc) = DateTime::<Utc>::from_timestamp(ts, 0) {
+        let local: DateTime<Local> = DateTime::from(utc);
+        local.format("%b %d, %H:%M").to_string()
+    } else {
+        "Recently".to_string()
+    }
 }
 
-pub fn update_ui_from_background(window_weak: slint::Weak<MainWindow>, is_paused: bool) {
-    std::thread::spawn(move || {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            let mut connected = false;
-            let mut user_name = "Not Connected".to_string();
-            let mut user_email = "Sign in via CLI or config".to_string();
-            let mut storage_used_str = "0 GB".to_string();
-            let mut storage_total_str = "15 GB".to_string();
-            let mut storage_ratio = 0.0f32;
+static AUTH_CACHE: std::sync::Mutex<Option<(std::time::Instant, bool, String, String, String, String, f32)>> =
+    std::sync::Mutex::new(None);
+static STATS_CACHE: std::sync::Mutex<Option<(std::time::Instant, CategoryStatsDto)>> =
+    std::sync::Mutex::new(None);
 
-            if let Ok(Some(_)) = load_stored_token() {
-                if let Ok(drive) = DriveClient::from_auth().await {
-                    if let Ok(about) = drive.get_about().await {
-                        connected = true;
+#[tauri::command]
+async fn get_app_state(state: State<'_, Arc<GuiContext>>) -> Result<AppStateDto, String> {
+    let mut is_connected = false;
+    let mut user_name = "Not Connected".to_string();
+    let mut user_email = "Sign in via Google OAuth".to_string();
+    let mut storage_used_str = "0 GB".to_string();
+    let mut storage_total_str = "15 GB".to_string();
+    let mut storage_ratio = 0.0f32;
+
+    let should_check_network = {
+        let cache = AUTH_CACHE.lock().unwrap();
+        if let Some((instant, conn, ref name, ref email, ref used, ref total, ratio)) = *cache {
+            if instant.elapsed() < std::time::Duration::from_secs(if conn { 60 } else { 15 }) {
+                is_connected = conn;
+                user_name = name.clone();
+                user_email = email.clone();
+                storage_used_str = used.clone();
+                storage_total_str = total.clone();
+                storage_ratio = ratio;
+                false
+            } else {
+                true
+            }
+        } else {
+            true
+        }
+    };
+
+    if should_check_network {
+        match load_stored_token() {
+            Ok(Some(_)) => match DriveClient::from_auth().await {
+                Ok(drive) => match drive.get_about().await {
+                    Ok(about) => {
+                        is_connected = true;
                         if let Some(u) = about.user {
                             user_name = u.display_name;
                             user_email = u.email_address;
@@ -72,363 +195,522 @@ pub fn update_ui_from_background(window_weak: slint::Weak<MainWindow>, is_paused
                             }
                         }
                     }
-                }
-            }
-
-            let mut dir_items: Vec<WatchedDir> = Vec::new();
-            if let Ok(cfg) = load_config() {
-                for d in cfg.directories {
-                    dir_items.push(WatchedDir {
-                        local_path: d.local_path.to_string_lossy().to_string().into(),
-                        drive_folder_id: d.drive_folder_id.into(),
-                        drive_folder_name: d.drive_folder_name.unwrap_or_else(|| "Google Drive".into()).into(),
-                    });
-                }
-            }
-
-            let mut total_files_tracked = 0i32;
-            let mut total_bytes_str = "0 MB".to_string();
-            let mut recent_items: Vec<RecentFile> = Vec::new();
-
-            if let Ok(db) = Database::open_default() {
-                if let Ok(stats) = db.get_db_stats() {
-                    total_files_tracked = stats.total_files as i32;
-                    total_bytes_str = format_bytes(stats.total_size_bytes);
-                }
-                if let Ok(recent) = db.get_recent_files(20) {
-                    for f in recent {
-                        recent_items.push(RecentFile {
-                            rel_path: f.rel_path.to_string_lossy().to_string().into(),
-                            size_str: format_bytes(f.size_bytes).into(),
-                            time_str: format_timestamp(f.last_sync_timestamp).into(),
-                        });
+                    Err(e) => {
+                        eprintln!("[xsync-gui] drive.get_about failed: {:#}", e);
                     }
+                },
+                Err(e) => {
+                    eprintln!("[xsync-gui] DriveClient::from_auth failed: {:#}", e);
                 }
+            },
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("[xsync-gui] load_stored_token error: {:#}", e);
             }
+        }
 
-            let total_dirs = dir_items.len() as i32;
+        let mut cache = AUTH_CACHE.lock().unwrap();
+        *cache = Some((
+            std::time::Instant::now(),
+            is_connected,
+            user_name.clone(),
+            user_email.clone(),
+            storage_used_str.clone(),
+            storage_total_str.clone(),
+            storage_ratio,
+        ));
+    }
 
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(w) = window_weak.upgrade() {
-                    w.set_is_connected(connected);
-                    w.set_user_name(user_name.into());
-                    w.set_user_email(user_email.into());
-                    w.set_storage_used_str(storage_used_str.into());
-                    w.set_storage_total_str(storage_total_str.into());
-                    w.set_storage_ratio(storage_ratio);
-                    w.set_total_directories(total_dirs);
-                    w.set_total_files_tracked(total_files_tracked);
-                    w.set_total_bytes_str(total_bytes_str.into());
-                    w.set_is_paused(is_paused);
-                    w.set_directories(ModelRc::new(VecModel::from(dir_items)));
-                    w.set_recent_files(ModelRc::new(VecModel::from(recent_items)));
-                }
+    let mut dir_items: Vec<WatchedDirDto> = Vec::new();
+    if let Ok(cfg) = load_config() {
+        for d in cfg.directories {
+            dir_items.push(WatchedDirDto {
+                local_path: d.local_path.to_string_lossy().to_string(),
+                drive_folder_id: d.drive_folder_id,
+                drive_folder_name: d.drive_folder_name.unwrap_or_else(|| "Google Drive".into()),
             });
-        });
-    });
+        }
+    }
+
+    let mut total_files_tracked = 0usize;
+    let mut total_bytes_str = "0 MB".to_string();
+
+    if let Ok(db) = Database::open_default() {
+        if let Ok(stats) = db.get_db_stats() {
+            total_files_tracked = stats.total_files as usize;
+            total_bytes_str = format_bytes(stats.total_size_bytes);
+        }
+    }
+
+    let is_paused = state.is_paused.load(Ordering::SeqCst);
+    let is_syncing = state.is_syncing.load(Ordering::SeqCst);
+
+    let status_message = if is_paused {
+        "Sync is paused".to_string()
+    } else if is_syncing {
+        let msg = state.status_message.lock().unwrap().clone();
+        if msg.is_empty() || msg == "All files up to date" {
+            "Synchronizing files...".to_string()
+        } else {
+            msg
+        }
+    } else if is_connected {
+        let msg = state.status_message.lock().unwrap().clone();
+        if msg.is_empty() {
+            "All files up to date".to_string()
+        } else {
+            msg
+        }
+    } else {
+        "Google Drive not connected".to_string()
+    };
+
+    Ok(AppStateDto {
+        is_connected,
+        is_syncing,
+        is_paused,
+        user_name,
+        user_email,
+        status_message,
+        storage_used_str,
+        storage_total_str,
+        storage_ratio,
+        total_directories: dir_items.len(),
+        total_files_tracked,
+        total_bytes_str,
+        directories: dir_items,
+    })
 }
 
-pub fn run() {
-    #[cfg(target_os = "linux")]
-    let _ = i_slint_core::api::set_xdg_app_id("xsync-gui");
+#[tauri::command]
+async fn get_recent_activity(limit: Option<usize>) -> Result<Vec<RecentFileDto>, String> {
+    let mut recent_items = Vec::new();
+    let l = limit.unwrap_or(50);
 
-    let main_window = MainWindow::new().expect("Failed to initialize Slint MainWindow");
-    let is_paused = Arc::new(AtomicBool::new(false));
-    let rt = Arc::new(Runtime::new().expect("Failed to create Tokio Runtime"));
-
-    // Initial state populate
-    update_ui_from_background(main_window.as_weak(), is_paused.load(Ordering::SeqCst));
-
-    // Callback: Sync All Now
-    {
-        let window_weak = main_window.as_weak();
-        let is_paused_clone = is_paused.clone();
-        let rt_clone = rt.clone();
-        main_window.on_sync_now(move || {
-            if is_paused_clone.load(Ordering::SeqCst) {
-                if let Some(w) = window_weak.upgrade() {
-                    w.set_status_message("Sync is currently paused.".into());
-                }
-                return;
-            }
-
-            let window_weak_inner = window_weak.clone();
-            let is_paused_val = is_paused_clone.load(Ordering::SeqCst);
-            if let Some(w) = window_weak.upgrade() {
-                w.set_is_syncing(true);
-                w.set_status_message("Synchronizing all Google Drive directories...".into());
-            }
-
-            rt_clone.spawn(async move {
-                let config = load_config().unwrap_or_default();
-                if let Ok(drive) = DriveClient::from_auth().await {
-                    if let Ok(db) = Database::open_default() {
-                        let opts = SyncOptions {
-                            dry_run: false,
-                            permanent_delete: false,
-                            concurrency: 4,
-                            show_progress: false,
-                            force: false,
-                        };
-
-                        for dir in config.directories {
-                            if !dir.local_path.exists() { continue; }
-                            if let Ok(coord) = SyncCoordinator::new(&dir.local_path, dir.drive_folder_id, drive.clone(), db.clone()) {
-                                let _ = coord.reconcile_with_options(&opts).await;
-                            }
-                        }
-                    }
-                }
-
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(w) = window_weak_inner.upgrade() {
-                        w.set_is_syncing(false);
-                        w.set_status_message("All Google Drive directories are in sync.".into());
-                    }
-                    update_ui_from_background(window_weak_inner, is_paused_val);
+    if let Ok(db) = Database::open_default() {
+        if let Ok(recent) = db.get_recent_files(l) {
+            for f in recent {
+                recent_items.push(RecentFileDto {
+                    rel_path: f.rel_path.to_string_lossy().to_string(),
+                    size_str: format_bytes(f.size_bytes),
+                    time_str: format_relative_timestamp(f.last_sync_timestamp),
+                    is_syncing: false,
                 });
-            });
-        });
+            }
+        }
     }
 
-    // Callback: Toggle Pause
-    {
-        let window_weak = main_window.as_weak();
-        let is_paused_clone = is_paused.clone();
-        main_window.on_toggle_pause(move || {
-            let current = is_paused_clone.load(Ordering::SeqCst);
-            let next = !current;
-            is_paused_clone.store(next, Ordering::SeqCst);
+    Ok(recent_items)
+}
 
-            if let Some(w) = window_weak.upgrade() {
-                w.set_is_paused(next);
-                if next {
-                    w.set_status_message("Synchronization paused.".into());
-                } else {
-                    w.set_status_message("Synchronization resumed.".into());
+fn categorize_ext(ext: &str) -> &'static str {
+    match ext {
+        "jpg" | "jpeg" | "png" | "gif" | "svg" | "webp" | "bmp" | "ico" | "tiff" | "heic" => "image",
+        "pdf" | "doc" | "docx" | "txt" | "md" | "rtf" | "odt" | "xls" | "xlsx" | "csv" | "ppt" | "pptx" | "epub" => "document",
+        "mp4" | "mkv" | "mov" | "avi" | "webm" | "flv" | "wmv" | "m4v" => "video",
+        "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" | "wma" => "audio",
+        "rs" | "ts" | "js" | "svelte" | "py" | "json" | "toml" | "yaml" | "yml" | "html" | "css" | "sh" | "c" | "cpp" | "h" | "go" | "java" | "sql" | "xml" => "code",
+        "zip" | "tar" | "gz" | "7z" | "bz2" | "xz" | "rar" | "deb" | "rpm" => "archive",
+        _ => "other",
+    }
+}
+
+#[tauri::command]
+async fn get_all_files(limit: Option<usize>) -> Result<Vec<DetailedFileDto>, String> {
+    let mut items = Vec::new();
+    let l = limit.unwrap_or(300);
+
+    if let Ok(db) = Database::open_default() {
+        if let Ok(files) = db.get_recent_files(l) {
+            for f in files {
+                let name = f
+                    .rel_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| f.rel_path.to_string_lossy().to_string());
+                let ext = f
+                    .rel_path
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                let category = categorize_ext(&ext).to_string();
+                let folder_name = f
+                    .local_root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Folder".to_string());
+                let full_path = f.local_root.join(&f.rel_path).to_string_lossy().to_string();
+
+                items.push(DetailedFileDto {
+                    name,
+                    rel_path: f.rel_path.to_string_lossy().to_string(),
+                    full_path,
+                    local_root: f.local_root.to_string_lossy().to_string(),
+                    folder_name,
+                    size_bytes: f.size_bytes,
+                    size_str: format_bytes(f.size_bytes),
+                    modified_secs: f.modified_secs,
+                    time_str: format_timestamp(f.modified_secs),
+                    synced_time_str: format_relative_timestamp(f.last_sync_timestamp),
+                    extension: ext,
+                    category,
+                });
+            }
+        }
+    }
+
+    Ok(items)
+}
+
+#[tauri::command]
+async fn get_category_stats() -> Result<CategoryStatsDto, String> {
+    {
+        let cache = STATS_CACHE.lock().unwrap();
+        if let Some((instant, ref stats)) = *cache {
+            if instant.elapsed() < std::time::Duration::from_secs(30) {
+                return Ok(stats.clone());
+            }
+        }
+    }
+
+    let mut stats = CategoryStatsDto::default();
+
+    if let Ok(db) = Database::open_default() {
+        if let Ok(files) = db.get_recent_files(10000) {
+            for f in files {
+                let ext = f
+                    .rel_path
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                let category = categorize_ext(&ext);
+                match category {
+                    "document" => {
+                        stats.documents_bytes += f.size_bytes;
+                        stats.documents_count += 1;
+                    }
+                    "image" => {
+                        stats.images_bytes += f.size_bytes;
+                        stats.images_count += 1;
+                    }
+                    "video" => {
+                        stats.videos_bytes += f.size_bytes;
+                        stats.videos_count += 1;
+                    }
+                    "audio" => {
+                        stats.audio_bytes += f.size_bytes;
+                        stats.audio_count += 1;
+                    }
+                    "code" => {
+                        stats.code_bytes += f.size_bytes;
+                        stats.code_count += 1;
+                    }
+                    "archive" => {
+                        stats.archives_bytes += f.size_bytes;
+                        stats.archives_count += 1;
+                    }
+                    _ => {
+                        stats.others_bytes += f.size_bytes;
+                        stats.others_count += 1;
+                    }
                 }
             }
-        });
+        }
     }
 
-    // Callback: Browse Local Folder using rfd (native folder picker)
-    {
-        let window_weak = main_window.as_weak();
-        main_window.on_browse_local_folder(move || {
-            let window_weak_clone = window_weak.clone();
-            std::thread::spawn(move || {
-                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                    let folder_str = folder.to_string_lossy().to_string();
-                    let folder_name = folder
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "DriveSync".to_string());
+    let mut cache = STATS_CACHE.lock().unwrap();
+    *cache = Some((std::time::Instant::now(), stats.clone()));
 
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(w) = window_weak_clone.upgrade() {
-                            w.set_new_folder_local(folder_str.into());
-                            if w.get_new_folder_remote().is_empty() {
-                                w.set_new_folder_remote(folder_name.into());
-                            }
+    Ok(stats)
+}
+
+#[tauri::command]
+fn open_folder(path: String) -> Result<(), String> {
+    let p = std::path::PathBuf::from(&path);
+    let target = if p.is_file() {
+        p.parent().map(|d| d.to_path_buf()).unwrap_or(p)
+    } else {
+        p
+    };
+    std::process::Command::new("xdg-open")
+        .arg(&target)
+        .spawn()
+        .map_err(|e| format!("Failed to open file manager: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn sync_all(state: State<'_, Arc<GuiContext>>) -> Result<String, String> {
+    if state.is_paused.load(Ordering::SeqCst) {
+        return Err("Sync is currently paused. Please resume first.".into());
+    }
+
+    if state.is_syncing.load(Ordering::SeqCst) {
+        return Ok("Sync already in progress.".into());
+    }
+
+    state.is_syncing.store(true, Ordering::SeqCst);
+    let is_syncing_clone = state.is_syncing.clone();
+    let status_msg_clone = state.status_message.clone();
+
+    tokio::spawn(async move {
+        let _guard = SyncGuard(is_syncing_clone);
+
+        {
+            let mut msg = status_msg_clone.lock().unwrap();
+            *msg = "Connecting to Google Drive...".to_string();
+        }
+
+        let config = load_config().unwrap_or_default();
+        match DriveClient::from_auth().await {
+            Ok(drive) => match Database::open_default() {
+                Ok(db) => {
+                    let opts = SyncOptions {
+                        dry_run: false,
+                        permanent_delete: false,
+                        concurrency: 4,
+                        show_progress: false,
+                        force: false,
+                    };
+
+                    for dir in config.directories {
+                        if !dir.local_path.exists() {
+                            continue;
                         }
+                        let folder_name = dir
+                            .local_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "Folder".to_string());
+
+                        {
+                            let mut msg = status_msg_clone.lock().unwrap();
+                            *msg = format!("Syncing {}...", folder_name);
+                        }
+
+                        if let Ok(coord) = SyncCoordinator::new(
+                            &dir.local_path,
+                            dir.drive_folder_id,
+                            drive.clone(),
+                            db.clone(),
+                        ) {
+                            let _ = coord.reconcile_with_options(&opts).await;
+                        }
+                    }
+
+                    *STATS_CACHE.lock().unwrap() = None;
+                    {
+                        let mut msg = status_msg_clone.lock().unwrap();
+                        *msg = "All files up to date".to_string();
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[xsync-gui] Database open error during sync: {:#}", e);
+                    let mut msg = status_msg_clone.lock().unwrap();
+                    *msg = "Database error during sync".to_string();
+                }
+            },
+            Err(e) => {
+                eprintln!("[xsync-gui] DriveClient auth error during sync: {:#}", e);
+                let mut msg = status_msg_clone.lock().unwrap();
+                *msg = "Authentication error during sync".to_string();
+            }
+        }
+    });
+
+    Ok("Sync triggered successfully.".into())
+}
+
+#[tauri::command]
+fn toggle_pause(state: State<'_, Arc<GuiContext>>) -> Result<bool, String> {
+    let current = state.is_paused.load(Ordering::SeqCst);
+    let next = !current;
+    state.is_paused.store(next, Ordering::SeqCst);
+    Ok(next)
+}
+
+#[tauri::command]
+async fn browse_folder() -> Result<Option<String>, String> {
+    let folder = rfd::AsyncFileDialog::new()
+        .set_title("Select Local Folder to Sync")
+        .pick_folder()
+        .await;
+
+    Ok(folder.map(|f| f.path().to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+async fn add_directory(local_path: String, remote_name: String) -> Result<String, String> {
+    let local = PathBuf::from(&local_path);
+    if !local.exists() {
+        return Err(format!("Directory {:?} does not exist", local));
+    }
+
+    let drive = DriveClient::from_auth()
+        .await
+        .map_err(|e| format!("Google Drive auth error: {}", e))?;
+
+    let folder_name = if remote_name.trim().is_empty() {
+        local
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "xsync_folder".to_string())
+    } else {
+        remote_name.trim().to_string()
+    };
+
+    let folder_id = match drive.find_child_by_name("root", &folder_name).await {
+        Ok(Some(existing)) if existing.is_folder() => existing.id,
+        _ => {
+            let created = drive
+                .create_folder("root", &folder_name)
+                .await
+                .map_err(|e| format!("Failed to create folder on Drive: {}", e))?;
+            created.id
+        }
+    };
+
+    add_or_update_directory(&local, &folder_id, Some(folder_name))
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+
+    *STATS_CACHE.lock().unwrap() = None;
+    Ok("Folder added successfully".into())
+}
+
+#[tauri::command]
+fn remove_directory(local_path: String) -> Result<String, String> {
+    let mut config = load_config().map_err(|e| format!("Failed to load config: {}", e))?;
+    config
+        .directories
+        .retain(|d| d.local_path != PathBuf::from(&local_path));
+    save_config(&config).map_err(|e| format!("Failed to save config: {}", e))?;
+    *STATS_CACHE.lock().unwrap() = None;
+    Ok("Folder removed successfully".into())
+}
+
+#[tauri::command]
+async fn run_diff(folder1: String, folder2: String) -> Result<Vec<DiffItemDto>, String> {
+    let drive = DriveClient::from_auth()
+        .await
+        .map_err(|e| format!("Auth error: {}", e))?;
+
+    let id1 = if folder1.trim().is_empty() || folder1 == "root" {
+        "root".to_string()
+    } else {
+        match drive.find_child_by_name("root", folder1.trim()).await {
+            Ok(Some(f)) => f.id,
+            _ => folder1.trim().to_string(),
+        }
+    };
+
+    let id2 = match drive.find_child_by_name("root", folder2.trim()).await {
+        Ok(Some(f)) => f.id,
+        _ => folder2.trim().to_string(),
+    };
+
+    let f1_files = drive
+        .list_files_recursive(&id1)
+        .await
+        .map_err(|e| format!("Failed listing folder 1: {}", e))?;
+    let f2_files = drive
+        .list_files_recursive(&id2)
+        .await
+        .map_err(|e| format!("Failed listing folder 2: {}", e))?;
+
+    use std::collections::HashMap;
+    let mut map1 = HashMap::new();
+    for (p, f) in f1_files {
+        map1.insert(p, f.md5_checksum);
+    }
+
+    let mut map2 = HashMap::new();
+    for (p, f) in f2_files {
+        map2.insert(p, f.md5_checksum);
+    }
+
+    let mut diffs = Vec::new();
+    for (p, md5_1) in &map1 {
+        match map2.get(p) {
+            Some(md5_2) => {
+                if md5_1 != md5_2 {
+                    diffs.push(DiffItemDto {
+                        path: p.to_string_lossy().to_string(),
+                        side: "modified".into(),
                     });
                 }
-            });
-        });
-    }
-
-    // Callback: Add Directory
-    {
-        let window_weak = main_window.as_weak();
-        let is_paused_clone = is_paused.clone();
-        let rt_clone = rt.clone();
-        main_window.on_add_directory(move |local, remote| {
-            let local_str = local.to_string();
-            let remote_str = if remote.is_empty() { "root".to_string() } else { remote.to_string() };
-            let window_weak_inner = window_weak.clone();
-            let is_paused_val = is_paused_clone.load(Ordering::SeqCst);
-
-            rt_clone.spawn(async move {
-                let p = PathBuf::from(&local_str);
-                let _ = std::fs::create_dir_all(&p);
-                if let Ok(canonical) = std::fs::canonicalize(&p) {
-                    if let Ok(drive) = DriveClient::from_auth().await {
-                        let drive_folder_id = if remote_str == "root" {
-                            "root".to_string()
-                        } else if let Ok(meta) = drive.get_file_metadata(&remote_str).await {
-                            if meta.is_folder() { meta.id } else { "root".to_string() }
-                        } else {
-                            match drive.find_child_by_name("root", &remote_str).await {
-                                Ok(Some(f)) if f.is_folder() => f.id,
-                                _ => {
-                                    drive.create_folder("root", &remote_str)
-                                        .await
-                                        .map(|f| f.id)
-                                        .unwrap_or_else(|_| "root".to_string())
-                                }
-                            }
-                        };
-
-                        let _ = add_or_update_directory(&canonical, &drive_folder_id, Some(remote_str.clone()));
-                        if let Ok(db) = Database::open_default() {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs() as i64;
-                            let _ = db.upsert_root(&xsync_core::db::SyncRootRecord {
-                                local_root: canonical,
-                                drive_root_id: drive_folder_id,
-                                drive_root_name: Some(remote_str),
-                                created_at: now,
-                                last_sync_at: now,
-                            });
-                        }
-                    }
-                }
-
-                update_ui_from_background(window_weak_inner, is_paused_val);
-            });
-        });
-    }
-
-    // Callback: Remove Directory
-    {
-        let window_weak = main_window.as_weak();
-        let is_paused_clone = is_paused.clone();
-        main_window.on_remove_directory(move |path| {
-            let p = PathBuf::from(path.as_str());
-            let canonical = std::fs::canonicalize(&p).unwrap_or(p);
-            if let Ok(mut config) = load_config() {
-                config.directories.retain(|d| d.local_path != canonical);
-                let _ = save_config(&config);
             }
-            update_ui_from_background(window_weak.clone(), is_paused_clone.load(Ordering::SeqCst));
-        });
-    }
-
-    // Callback: Run Diff
-    {
-        let window_weak = main_window.as_weak();
-        let rt_clone = rt.clone();
-        main_window.on_run_diff(move |folder1, folder2| {
-            let f1 = folder1.to_string();
-            let f2 = folder2.to_string();
-            let window_weak_inner = window_weak.clone();
-
-            if let Some(w) = window_weak.upgrade() {
-                w.set_diff_summary("Comparing folders on Google Drive...".into());
+            None => {
+                diffs.push(DiffItemDto {
+                    path: p.to_string_lossy().to_string(),
+                    side: "only_in_source".into(),
+                });
             }
-
-            rt_clone.spawn(async move {
-                if let Ok(drive) = DriveClient::from_auth().await {
-                    let files1 = drive.list_files_recursive(&f1).await.unwrap_or_default();
-                    let files2 = drive.list_files_recursive(&f2).await.unwrap_or_default();
-
-                    let map1: HashMap<PathBuf, &DriveFile> = files1.iter().map(|(p, f)| (p.clone(), f)).collect();
-                    let map2: HashMap<PathBuf, &DriveFile> = files2.iter().map(|(p, f)| (p.clone(), f)).collect();
-
-                    let mut items: Vec<DiffItem> = Vec::new();
-                    let mut identical = 0;
-                    let mut modified = 0;
-
-                    for (path, f1_meta) in &map1 {
-                        if let Some(f2_meta) = map2.get(path) {
-                            let md5_1 = f1_meta.md5_checksum.as_deref().unwrap_or("");
-                            let md5_2 = f2_meta.md5_checksum.as_deref().unwrap_or("");
-                            if !md5_1.is_empty() && md5_1 == md5_2 {
-                                identical += 1;
-                            } else {
-                                modified += 1;
-                                items.push(DiffItem {
-                                    path: path.to_string_lossy().to_string().into(),
-                                    side: "modified".into(),
-                                });
-                            }
-                        } else {
-                            items.push(DiffItem {
-                                path: path.to_string_lossy().to_string().into(),
-                                side: "unique_to_source".into(),
-                            });
-                        }
-                    }
-
-                    for (path, _) in &map2 {
-                        if !map1.contains_key(path) {
-                            items.push(DiffItem {
-                                path: path.to_string_lossy().to_string().into(),
-                                side: "unique_to_destination".into(),
-                            });
-                        }
-                    }
-
-                    let summary = format!(
-                        "Diff completed: {} identical, {} modified, {} source-only, {} dest-only",
-                        identical, modified,
-                        items.iter().filter(|i| i.side == "unique_to_source").count(),
-                        items.iter().filter(|i| i.side == "unique_to_destination").count()
-                    );
-
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(w) = window_weak_inner.upgrade() {
-                            w.set_diff_summary(summary.into());
-                            w.set_diff_items(ModelRc::new(VecModel::from(items)));
-                        }
-                    });
-                }
-            });
-        });
+        }
     }
 
-    // Callback: Run Merge
-    {
-        let window_weak = main_window.as_weak();
-        let rt_clone = rt.clone();
-        main_window.on_run_merge(move |src, dest| {
-            let s = src.to_string();
-            let d = dest.to_string();
-            let window_weak_inner = window_weak.clone();
-
-            if let Some(w) = window_weak.upgrade() {
-                w.set_diff_summary("Merging missing files into destination...".into());
-            }
-
-            rt_clone.spawn(async move {
-                if let Ok(drive) = DriveClient::from_auth().await {
-                    let files1 = drive.list_files_recursive(&s).await.unwrap_or_default();
-                    let files2 = drive.list_files_recursive(&d).await.unwrap_or_default();
-                    let map2: HashMap<PathBuf, &DriveFile> = files2.iter().map(|(p, f)| (p.clone(), f)).collect();
-
-                    let mut copied = 0;
-                    for (rel_path, file) in &files1 {
-                        if !map2.contains_key(rel_path) {
-                            let parent_rel = rel_path.parent().unwrap_or_else(|| Path::new(""));
-                            if let Ok(dest_parent_id) = drive.ensure_remote_dir_path(&d, parent_rel).await {
-                                if drive.copy_file(&file.id, &dest_parent_id, &file.name).await.is_ok() {
-                                    copied += 1;
-                                }
-                            }
-                        }
-                    }
-
-                    let msg = format!("Merge complete: {} missing files copied.", copied);
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(w) = window_weak_inner.upgrade() {
-                            w.set_diff_summary(msg.into());
-                        }
-                    });
-                }
+    for p in map2.keys() {
+        if !map1.contains_key(p) {
+            diffs.push(DiffItemDto {
+                path: p.to_string_lossy().to_string(),
+                side: "only_in_dest".into(),
             });
-        });
+        }
     }
 
-    // Callback: Systemd Action
-    {
-        main_window.on_systemd_action(move |action| {
-            let act = action.to_string();
-            std::thread::spawn(move || {
-                match act.as_str() {
-                    "install" => {
-                        let service_content = r#"[Unit]
+    Ok(diffs)
+}
+
+#[tauri::command]
+async fn run_merge(source: String, destination: String) -> Result<String, String> {
+    let drive = DriveClient::from_auth()
+        .await
+        .map_err(|e| format!("Auth error: {}", e))?;
+
+    let src_id = if source.trim().is_empty() || source == "root" {
+        "root".to_string()
+    } else {
+        match drive.find_child_by_name("root", source.trim()).await {
+            Ok(Some(f)) => f.id,
+            _ => source.trim().to_string(),
+        }
+    };
+
+    let dest_id = match drive.find_child_by_name("root", destination.trim()).await {
+        Ok(Some(f)) => f.id,
+        _ => destination.trim().to_string(),
+    };
+
+    let src_files = drive
+        .list_files_recursive(&src_id)
+        .await
+        .map_err(|e| format!("Failed listing source: {}", e))?;
+    let dest_files = drive
+        .list_files_recursive(&dest_id)
+        .await
+        .map_err(|e| format!("Failed listing destination: {}", e))?;
+
+    use std::collections::HashSet;
+    let mut dest_set = HashSet::new();
+    for (p, _) in dest_files {
+        dest_set.insert(p);
+    }
+
+    let mut copied_count = 0;
+    for (p, f) in src_files {
+        if !dest_set.contains(&p) {
+            let _ = drive.copy_file(&f.id, &dest_id, &f.name).await;
+            copied_count += 1;
+        }
+    }
+
+    Ok(format!("Successfully merged {} missing files.", copied_count))
+}
+
+#[tauri::command]
+fn systemd_action(action: String) -> Result<String, String> {
+    match action.as_str() {
+        "install" => {
+            let service_content = r#"[Unit]
 Description=xsync - Linux-Native Git-Aware Realtime Google Drive Sync Daemon
 After=network.target
 
@@ -441,84 +723,200 @@ RestartSec=10
 [Install]
 WantedBy=default.target
 "#;
-                        if let Some(cfg) = dirs::config_dir() {
-                            let user_dir = cfg.join("systemd/user");
-                            let _ = std::fs::create_dir_all(&user_dir);
-                            let _ = std::fs::write(user_dir.join("xsync.service"), service_content);
-                            let _ = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status();
-                            let _ = std::process::Command::new("systemctl").args(["--user", "enable", "--now", "xsync.service"]).status();
-                        }
-                    }
-                    "restart" => {
-                        let _ = std::process::Command::new("systemctl").args(["--user", "restart", "xsync.service"]).status();
-                    }
-                    "start" => {
-                        let _ = std::process::Command::new("systemctl").args(["--user", "start", "xsync.service"]).status();
-                    }
-                    "stop" => {
-                        let _ = std::process::Command::new("systemctl").args(["--user", "stop", "xsync.service"]).status();
-                    }
-                    _ => {}
+            if let Some(cfg) = dirs::config_dir() {
+                let user_dir = cfg.join("systemd/user");
+                let _ = std::fs::create_dir_all(&user_dir);
+                let _ = std::fs::write(user_dir.join("xsync.service"), service_content);
+                let _ = std::process::Command::new("systemctl")
+                    .args(["--user", "daemon-reload"])
+                    .status();
+                let _ = std::process::Command::new("systemctl")
+                    .args(["--user", "enable", "--now", "xsync.service"])
+                    .status();
+            }
+            Ok("Service installed and enabled.".into())
+        }
+        "start" => {
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "start", "xsync.service"])
+                .status();
+            Ok("Service started.".into())
+        }
+        "stop" => {
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "stop", "xsync.service"])
+                .status();
+            Ok("Service stopped.".into())
+        }
+        "restart" => {
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "restart", "xsync.service"])
+                .status();
+            Ok("Service restarted.".into())
+        }
+        _ => Err("Invalid action".into()),
+    }
+}
+
+#[tauri::command]
+async fn login() -> Result<String, String> {
+    let cfg = load_config().unwrap_or_default();
+    let (cid, csec) = if let Some(ref id) = cfg.client_id {
+        (id.clone(), cfg.client_secret.clone())
+    } else {
+        (
+            DEFAULT_CLIENT_ID.to_string(),
+            DEFAULT_CLIENT_SECRET.map(|s| s.to_string()),
+        )
+    };
+
+    let token = execute_oauth_login(&cid, csec)
+        .await
+        .map_err(|e| format!("OAuth login error: {}", e))?;
+
+    save_stored_token(&token).map_err(|e| format!("Failed to save token: {}", e))?;
+    *AUTH_CACHE.lock().unwrap() = None;
+    Ok("Authentication successful!".into())
+}
+
+#[tauri::command]
+fn logout() -> Result<String, String> {
+    if let Ok(p) = token_path() {
+        let _ = std::fs::remove_file(p);
+    }
+    *AUTH_CACHE.lock().unwrap() = None;
+    Ok("Logged out successfully.".into())
+}
+
+pub fn run() {
+    let is_paused = Arc::new(AtomicBool::new(false));
+    let is_syncing = Arc::new(AtomicBool::new(false));
+    let status_message = Arc::new(std::sync::Mutex::new("All files up to date".to_string()));
+    let rt = Arc::new(Runtime::new().expect("Failed to create Tokio Runtime"));
+
+    let context = Arc::new(GuiContext {
+        is_paused: is_paused.clone(),
+        is_syncing: is_syncing.clone(),
+        status_message: status_message.clone(),
+        rt: rt.clone(),
+    });
+
+    // Start background inotify watcher daemon for continuous real-time sync
+    {
+        let is_paused_watcher = is_paused.clone();
+        let is_syncing_watcher = is_syncing.clone();
+        let status_msg_watcher = status_message.clone();
+
+        rt.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            let Ok(drive) = DriveClient::from_auth().await else {
+                return;
+            };
+            let Ok(db) = Database::open_default() else {
+                return;
+            };
+            let config = load_config().unwrap_or_default();
+
+            let mut debouncers = Vec::new();
+
+            for dir in config.directories {
+                if !dir.local_path.exists() {
+                    continue;
                 }
-            });
-        });
-    }
 
-    // Callback: Refresh State
-    {
-        let window_weak = main_window.as_weak();
-        let is_paused_clone = is_paused.clone();
-        main_window.on_refresh_state(move || {
-            update_ui_from_background(window_weak.clone(), is_paused_clone.load(Ordering::SeqCst));
-        });
-    }
-
-    // Callback: Logout
-    {
-        let window_weak = main_window.as_weak();
-        let is_paused_clone = is_paused.clone();
-        main_window.on_logout(move || {
-            if let Ok(p) = token_path() {
-                let _ = std::fs::remove_file(p);
-            }
-            update_ui_from_background(window_weak.clone(), is_paused_clone.load(Ordering::SeqCst));
-        });
-    }
-
-    // Callback: Login
-    {
-        let window_weak = main_window.as_weak();
-        let is_paused_clone = is_paused.clone();
-        let rt_clone = rt.clone();
-        main_window.on_login(move || {
-            let window_weak_inner = window_weak.clone();
-            let is_paused_val = is_paused_clone.load(Ordering::SeqCst);
-            if let Some(w) = window_weak.upgrade() {
-                w.set_status_message("Opening Google authentication in browser...".into());
-            }
-
-            rt_clone.spawn(async move {
-                use xsync_core::auth::{execute_oauth_login, save_stored_token, DEFAULT_CLIENT_ID, DEFAULT_CLIENT_SECRET};
-                let cfg = load_config().unwrap_or_default();
-                let (cid, csec) = if let Some(ref id) = cfg.client_id {
-                    (id.clone(), cfg.client_secret.clone())
-                } else {
-                    (DEFAULT_CLIENT_ID.to_string(), DEFAULT_CLIENT_SECRET.map(|s| s.to_string()))
+                let debounce_ms = dir.debounce_ms.max(500);
+                let Ok(watcher) = xsync_core::watcher::FsWatcher::new(
+                    &dir.local_path,
+                    std::time::Duration::from_millis(debounce_ms),
+                ) else {
+                    continue;
                 };
 
-                if let Ok(token) = execute_oauth_login(&cid, csec).await {
-                    let _ = save_stored_token(&token);
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(w) = window_weak_inner.upgrade() {
-                            w.set_status_message("Authentication successful!".into());
+                let Ok(coord) = SyncCoordinator::new(
+                    &dir.local_path,
+                    dir.drive_folder_id.clone(),
+                    drive.clone(),
+                    db.clone(),
+                ) else {
+                    continue;
+                };
+
+                let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+                let Ok(debouncer) = watcher.start_watching(tx) else {
+                    continue;
+                };
+                debouncers.push(debouncer);
+
+                let is_paused_inner = is_paused_watcher.clone();
+                let is_syncing_inner = is_syncing_watcher.clone();
+                let status_msg_inner = status_msg_watcher.clone();
+                let coord = Arc::new(coord);
+
+                tokio::spawn(async move {
+                    while let Some(change) = rx.recv().await {
+                        if is_paused_inner.load(Ordering::SeqCst) {
+                            continue;
                         }
-                        update_ui_from_background(window_weak_inner, is_paused_val);
-                    });
-                }
-            });
+
+                        // Directory changes or folder creations are handled silently in the background
+                        // Only actual file uploads/deletions trigger the visible syncing state
+                        let is_file_event = match &change {
+                            xsync_core::watcher::FsChange::CreateOrModify(p) => p.is_file(),
+                            xsync_core::watcher::FsChange::Delete(_) => true,
+                        };
+
+                        if is_file_event {
+                            let _guard = SyncGuard(is_syncing_inner.clone());
+                            is_syncing_inner.store(true, Ordering::SeqCst);
+                            {
+                                let mut msg = status_msg_inner.lock().unwrap();
+                                *msg = "Syncing local change...".to_string();
+                            }
+
+                            if let Err(e) = coord.handle_fs_change(change).await {
+                                eprintln!("[xsync-gui watcher] handle_fs_change error: {:#}", e);
+                            }
+
+                            *STATS_CACHE.lock().unwrap() = None;
+
+                            {
+                                let mut msg = status_msg_inner.lock().unwrap();
+                                *msg = "All files up to date".to_string();
+                            }
+                        } else {
+                            let _ = coord.handle_fs_change(change).await;
+                        }
+                    }
+                });
+            }
+
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                let _ = &debouncers;
+            }
         });
     }
 
-    // Run the native event loop
-    main_window.run().expect("Error running Slint native event loop");
+    tauri::Builder::default()
+        .manage(context)
+        .invoke_handler(tauri::generate_handler![
+            get_app_state,
+            get_recent_activity,
+            get_all_files,
+            get_category_stats,
+            open_folder,
+            sync_all,
+            toggle_pause,
+            browse_folder,
+            add_directory,
+            remove_directory,
+            run_diff,
+            run_merge,
+            systemd_action,
+            login,
+            logout,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 }
